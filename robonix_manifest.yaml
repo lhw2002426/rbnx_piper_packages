@@ -1,0 +1,376 @@
+# Robonix deploy manifest for the Piper-arm + Orbbec + grasp pipeline.
+#
+# Stage progress (see /Users/howenliu/lab/grasp/MIGRATION_PLAN.md):
+#   Stage 0 ✅ — system: block live, atlas + executor + pilot up
+#   Stage 1 ✅ — orbbec_camera primitive  (url: lhw2002426/OrbbecSDK_rbnx)
+#   Stage 2 ✅ — piper_ctl primitive      (url: lhw2002426/piper_ctl_rbnx)
+#   Stage 3 ✅ — piper_description + easy_handeye2 primitives
+#                (url: lhw2002426/{piper_description_rbnx,easy_handeye2_rbnx};
+#                 calib YAML is still an identity PLACEHOLDER — replace
+#                 before real hardware. See easy_handeye2_rbnx README.)
+#   Stage 4 ✅ — yolo_world + yolo_grasp services
+#                (url: lhw2002426/{yolo_world_rbnx,yolo_grasp_rbnx};
+#                 yolo_grasp is in PLACEHOLDER mode — every grasp_request
+#                 returns success=false until the real estimator is
+#                 wired in. See yolo_grasp_rbnx README.)
+#   Stage 5 ✅ — piper_moveit service     (url: lhw2002426/piper_moveit_rbnx)
+#   Stage 6 ✅ — pick skill — LLM-facing entry point
+#                (url: lhw2002426/pick_skill_rbnx)
+#
+# Pending hardware verification — see MIGRATION_PLAN.md tracking table.
+#
+# As later stages land, append packages to the primitive: / service:
+# / skill: blocks below in dependency order (§2.2 of MIGRATION_PLAN).
+#
+# ─── Boot ordering: STRICTLY SERIAL, declaration order ─────────────
+# rbnx boot v0.1.x launches packages STRICTLY in the YAML
+# declaration order: every primitive[i] must reach Driver(CMD_INIT)
+# ok=true before primitive[i+1] is spawned; same for service[] and
+# skill[]. There is NO "deferred" retry mechanism — Driver returning
+# ok=false aborts the whole boot. So:
+#   1) put providers BEFORE consumers
+#   2) packages without a `*/driver` interface skip CMD_INIT entirely
+#      and are considered "up" the moment they register on atlas.
+# ───────────────────────────────────────────────────────────────────
+
+manifestVersion: 1
+name: robonix-piper-grasp-deploy
+
+env:
+  # Pilot's LLM upstream — override on the launching shell (or via a
+  # sourced .env) before `rbnx boot`. Empty values are accepted by
+  # pilot's startup and just mean "the chat path won't actually
+  # answer until these are set"; the rest of the system (atlas /
+  # executor / liaison / memory) still comes up cleanly, which is
+  # what Stage 0 validates.
+
+  # ─── Stage 3 — easy_handeye2_rbnx ─────────────────────────────────
+  # easy_handeye2_rbnx has no `*/driver` capability, so its config
+  # CANNOT be delivered via the per-package `config:` block (rbnx
+  # boot v0.1 only routes config through Driver(CMD_INIT, config_json)).
+  # Use top-level env: instead. See package README "Config / overrides".
+  # EASY_HANDEYE2_CALIB_NAME: my_eih_calib
+  # Or full absolute path (wins over CALIB_NAME):
+  EASY_HANDEYE2_CALIB_PATH: /home/syswonder/.ros2/easy_handeye2/calibrations/my_eih_calib.calib
+  # Force-overwrite ~/.ros2/easy_handeye2/calibrations/<name>.calib
+  # (default: keep existing if any — operator may have just run
+  # `easy_handeye2 calibrate` GUI):
+  # EASY_HANDEYE2_FORCE_STAGE: "1"
+
+  # ─── Stage 3A — piper_description_rbnx (URDF variant) ─────────────
+  # Default: vendored urdf/piper_description.urdf (with-gripper,
+  # joint1..joint8). Override to no-gripper variant:
+  # PIPER_URDF_PATH: ${RBNX_INVOCATION_CWD}/../packages/piper_description_rbnx/src/piper_description/urdf/piper_no_gripper_description.urdf
+
+system:
+  atlas:
+    listen: 127.0.0.1:50051
+    log: info
+  executor:
+    listen: 127.0.0.1:50061
+    log: info
+  pilot:
+    listen: 127.0.0.1:50071
+    log: info
+    vlm:
+      upstream: https://api.ofox.ai/v1
+      api_key: sk-of-GZXXiYLTWxGtDWEyqBzyJfTEZpByJPjvbhBnzxGOnlzGZVeooWXAkNvjAjHzcoxf
+      model: gpt-5.4-mini
+      api_format: openai
+  liaison:
+    listen: 127.0.0.1:50081
+    log: info
+
+  # Non-builtin system services. rbnx boot resolves these by name to
+  # `<robonix_source>/system/<key>/`. Currently only memory/ /
+  # scene/ / speech/ are shipped under that path. For Stage 0 we
+  # only need memory (used by pilot for chat history). scene and
+  # speech are heavyweight (need docker / weights / mics) and
+  # intentionally omitted until later stages need them.
+  # memory:
+  #   backend: sqlite
+  #   log: info
+
+# ─── Packages ──────────────────────────────────────────────────────
+# Filled in stage-by-stage — see MIGRATION_PLAN.md.
+
+primitive:
+  # ── Stage 1: Orbbec Dabai DCW RGBD camera ─────────────────────────
+  # Owns primitive/camera/*. Wraps `orbbec_camera dabai_dcw.launch.py`,
+  # waits for first RGB frame, then atlas-declares rgb / depth /
+  # camera_info on /camera/{color,depth}/*. Must stay FIRST among the
+  # primitives that consume `primitive/camera/*` indirectly (none here
+  # yet — yolo_world / yolo_grasp consume it from the service: block).
+  #
+  - name: orbbec_camera
+    url: https://github.com/lhw2002426/OrbbecSDK_rbnx
+    branch: main
+    config:
+      camera_name: camera             # ROS namespace; topic prefix
+      depth_registration: true        # HW-align depth pixels to color frame
+      enable_d2c_viewer: false        # debug RViz off in deploy
+      color_width: 640
+      color_height: 480
+      color_fps: 10                   # dabai_dcw firmware default
+      depth_width: 640
+      depth_height: 400
+      depth_fps: 10
+      sentinel_timeout_s: 30.0
+      # serial_number: ""             # uncomment to pin to a specific device
+      # usb_port: ""
+
+  # ── Stage 2: AgileX Piper 6-DoF arm ───────────────────────────────
+  # Owns primitive/arm/*. Wraps `piper start_single_piper.launch.py`,
+  # waits for first /arm/joint_states_single, then atlas-declares
+  # joint_states / arm_status / end_pose / pos_cmd. Stage 3A
+  # piper_description consumes joint_states for robot_state_publisher;
+  # Stage 5 piper_moveit publishes to pos_cmd; Stage 6 pick_skill
+  # polls arm_status. So this MUST come before all of those in YAML
+  # order.
+  #
+  # Ordering vs orbbec_camera: both are independent primitives — TF
+  # subtrees from piper_description (uses joint_states) and the camera
+  # are disjoint. Either order works for boot; we keep camera first
+  # only because it warms up the slower (~3-5s sentinel) of the two.
+  #
+  # CAN bring-up: this manifest takes the recommended path (Path A in
+  # the package README) — assume can_piper is already up. Run
+  # `bash ../packages/piper_ctl_rbnx/scripts/can_activate.sh \
+  #     can_piper 1000000 "1-4.2:1.0"`
+  # ONCE per host boot, ahead of `rbnx boot`. Set auto_can_setup=true
+  # below to delegate that to the package itself (requires passwordless
+  # sudo).
+  - name: piper_ctl
+    url: https://github.com/lhw2002426/piper_ctl_rbnx
+    branch: main
+    config:
+      can_port: can_piper
+      can_bitrate: 1000000
+      can_usb_address: "1-4.4:1.0"  # set when the host has > 1 CAN device
+      auto_can_setup: false           # see "CAN bring-up" in package README
+      auto_enable: true
+      gripper_exist: true
+      gripper_val_mutiple: 2          # upstream typo preserved
+      sentinel_timeout_s: 30.0
+
+  # ── Stage 3A: Piper URDF + robot_state_publisher ──────────────────
+  # Owns no atlas-routed contracts (capabilities: []). Publishes the
+  # joint-driven TF subtree:
+  #   base_link → link1 → ... → link6
+  # by running robot_state_publisher with the vendored Piper URDF
+  # remapping `joint_states` to `/arm/joint_states_single`.
+  #
+  # MUST come AFTER piper_ctl in this list — piper_ctl is what
+  # publishes the JointState messages this RSP subscribes to. Without
+  # a JointState producer, RSP stays quiet on /tf and nothing
+  # downstream that does TF lookups (yolo_grasp's grasp-pose →
+  # base-frame transform) will work.
+  #
+  - name: piper_description
+    url: https://github.com/lhw2002426/piper_description_rbnx
+    branch: main
+    config: {} 
+  # — package has no Driver(CMD_INIT) handler, 
+  # so theconfig block is ineffective. URDF variant is selected via the
+  # top-level env: PIPER_URDF_PATH (default: with-gripper variant).
+
+  # ── Stage 3B: hand-eye calibration TF ─────────────────────────────
+  # Owns no atlas-routed contracts (capabilities: []). Publishes the
+  # static hand-eye TF:
+  #   link6 → camera_color_optical_frame
+  # by vendoring upstream easy_handeye2 + easy_handeye2_msgs and
+  # running `ros2 launch easy_handeye2 publish.launch.py
+  # name:=<name>`. The vendored handeye_publisher reads
+  # `~/.ros2/easy_handeye2/calibrations/<name>.calib` (upstream
+  # hardcodes that path), so the package's atlas_register_and_launch
+  # script first stages config/calibrations/<name>.calib there.
+  #
+  # Order vs piper_description: independent — the two packages emit
+  # disjoint /tf_static subtrees. Putting easy_handeye2 after
+  # piper_description is just for readability (the chain conceptually
+  # builds outward from base_link).
+  #
+  # ⚠️ CALIB IS A PLACEHOLDER. The vendored
+  #    config/calibrations/my_eih_calib.calib ships an identity
+  #    transform with eye_in_hand metadata. Replace before running
+  #    on real hardware — see the package README "Replacing the
+  #    calibration" section.
+  #
+  # Calib name override goes in the top-level env: block above
+  # (EASY_HANDEYE2_CALIB_NAME / EASY_HANDEYE2_CALIB_PATH). NOT here
+  # — this package has no Driver(CMD_INIT) handler, so the per-
+  # package config: block is ignored.
+  #
+  - name: easy_handeye2
+    url: https://github.com/lhw2002426/easy_handeye2_rbnx
+    branch: main
+
+# service:
+service:
+  # ── Stage 4A: open-vocab object detection (YOLOE / YOLO-World) ────
+  # The ONLY GPU/ML package in the pipeline. Owns
+  # service/perception/object_detect/*.
+  #
+  # Surfaces both atlas-routed MCP (Pilot's path) and the legacy ROS
+  # service /yolo/detect_object (pick.py + yolo_grasp_rbnx still call
+  # it). Both share one detection function.
+  #
+  # Atlas-resolved upstream: primitive/camera/{rgb, depth, camera_info}.
+  # Defaults match OrbbecSDK_rbnx topic names — no override needed for
+  # the standard piper_grasp_deploy.
+  #
+  # Order: MUST come AFTER orbbec_camera (consumes the camera streams).
+  # Order vs piper_ctl / piper_description / easy_handeye2 doesn't
+  # matter — those are TF / arm primitives, disjoint from yolo_world's
+  # camera-only deps.
+  #
+  # - name: yolo_world
+  #   url: https://github.com/lhw2002426/yolo_world_rbnx
+  #   branch: main
+  #   config:
+  #     # YOLOE weights — leave empty to let ultralytics auto-download
+  #     # to ~/.cache on first inference, or set absolute path to a
+  #     # pre-downloaded checkpoint:
+  #     # model_path: /opt/yolo_weights/yoloe-11l-seg-pf.pt
+  #     model_path: ""
+
+  #     # Topic overrides — empty means "atlas-resolve, fall back to
+  #     # default if no provider". The defaults already match
+  #     # OrbbecSDK_rbnx so the empties Just Work for this deploy.
+  #     rgb_topic: ""
+  #     depth_topic: ""
+  #     camera_info_topic: ""
+
+  # - name: llm_detect
+  #   url: https://github.com/lhw2002426/llm_detect_rbnx
+  #   branch: main
+  #   config:
+  #     # LLM API endpoint (OpenAI-compatible)
+  #     llm_base_url: "https://api.ofox.ai/v1"
+  #     llm_api_key: "sk-of-WmCvqhOuLuBxAExANMYGsYKajzuhTYyxAMuofRRdDbQnlKNUsYdPHAmizheeamZb"
+  #     llm_model: "google/gemini-3.1-flash-lite"
+  #     temperature: 0.7
+
+  #     # Set to true if camera is mounted opposite to arm (image needs
+  #     # 180° rotation before sending to LLM)
+  #     rotation_cam2arm: true
+
+  #     # Topic overrides — empty means "atlas-resolve, fall back to
+  #     # default if no provider". The defaults already match
+  #     # OrbbecSDK_rbnx so the empties Just Work for this deploy.
+  #     rgb_topic: ""
+  #     depth_topic: ""
+  #     camera_info_topic: ""
+
+  # ── Stage 4B: geometric grasp-pose estimator ──────────────────────
+  # Pure CPU. Owns service/perception/grasp_pose/*. Calls yolo_world
+  # as a CLIENT (currently via legacy ROS service /yolo/detect_object;
+  # Stage 6 will switch to atlas MCP).
+  #
+  # ⚠️ Currently in PLACEHOLDER mode — every grasp_request returns
+  # success=false until the real upstream code is dropped into
+  # `yolo_grasp/_upstream/yolo_grasp.py` and IS_PLACEHOLDER flipped to
+  # False. See package README "Placeholder mode".
+  #
+  # Order: MUST come AFTER yolo_world (atlas dep + ROS service
+  # client). Order vs primitives doesn't matter (no direct primitive
+  # subscriptions).
+  #
+  # - name: yolo_grasp
+  #   url: https://github.com/lhw2002426/yolo_grasp_rbnx
+  #   branch: main
+  #   # config: {} — no tunables until the real estimator lands.
+  #   # When wired, expect knobs like:
+  #   #   approach_distance_m: 0.10
+  #   #   gripper_max_width_m: 0.08
+  #   #   score_threshold:     0.3
+
+  # ── Stage 5: MoveIt + grasp executor ──────────────────────────────
+  # Owns service/manipulation/*. Wraps the upstream MoveIt config
+  # (piper_with_gripper_moveit) + the C++ moveit_control_node_yolo
+  # grasp executor. Adds the atlas-routed `execute_grasp` MCP tool.
+  #
+  # Stage 5's core risk avoidance: zero modifications to the C++
+  # source. The MCP handler bridges via the legacy ROS topic
+  # /graspnet/grasps + polls /arm/arm_status for busy→idle. See
+  # the package README for the full design rationale, the launch
+  # fork explanation, and the link6 ↔ arm/link6 TF bridge trick.
+  #
+  # Order: MUST come AFTER piper_ctl (sentinel waits for first
+  # /arm/arm_status sample, which only piper_ctl publishes) and
+  # AFTER easy_handeye2 (its static link6 → camera_color_optical_frame
+  # TF is needed for the cpp's tf2 transform inside execute_grasp).
+  # piper_description is also a dep (provides the unprefixed TF
+  # subtree). Order vs yolo_world / yolo_grasp doesn't matter
+  # (manipulation has no perception dep at boot time).
+  #
+  # - name: piper_moveit
+  #   url: https://github.com/lhw2002426/piper_moveit_rbnx
+  #   branch: main
+  #   config:
+  #     arm_group_name:       arm
+  #     end_effector_link:    link6      # in prefixed TF subtree
+  #     gripper_action_name:  /gripper_controller/follow_joint_trajectory
+  #     sentinel_timeout_s:   60.0           # launch + first arm_status
+
+  - name: openvla_client
+    url: https://github.com/lhw2002426/vla_client_rbnx
+    branch: main
+    config:
+      vla_server_url: "http://162.105.88.184:8777"
+      full_image_topic: /exterior_camera/color/image_raw
+      wrist_image_topic: /camera/color/image_raw
+      joint_states_topic: /arm/joint_states_single
+      pos_cmd_topic: /arm/pos_cmd
+      action_hz: 2
+
+      # 归一化常量（必须与训练数据集一致）
+      action_min: [-28042, 80978, -98976, -772.51, 49456.09, -29964, -400]
+      action_max: [4566, 122947, -63015, 3498, 68869.87, 14980, 84500]
+
+      # 硬件安全限位（SDK raw 单位，超出范围的指令会被裁剪）
+      hw_action_min: [-31400, 0, -150000, -90000, 0, -90000, -500]
+      hw_action_max: [31400, 180000, 0, 90000, 72000, 90000, 90000]
+
+      # 每步最大变化量（SDK raw 单位，防止关节突跳）
+      max_delta_per_step_sdk: [5000, 5000, 5000, 5000, 5000, 5000, 15000]
+
+      action_steps_to_execute: 5   # 每次调用执行的动作步数
+
+
+# skill:
+skill:
+  # ── Stage 6: pick-up-named-object skill ───────────────────────────
+  # The LLM-facing entry point of the whole pipeline. Owns
+  # robonix/skill/pick/*. Orchestrates yolo_world + yolo_grasp +
+  # piper_moveit into a single user-invocable `pick(object_name)`
+  # MCP tool. All upstream calls go over MCP HTTP (atlas-resolved
+  # at on_activate time) — no fallback to the legacy ROS service
+  # path. See package README for full semantics.
+  #
+  # Lazy activate: rbnx boot leaves the skill in INITIALIZED state.
+  # The executor sends Driver(CMD_ACTIVATE) on the first MCP call,
+  # at which point the skill blocks up to 60s waiting for atlas to
+  # resolve all three upstream services. So all of yolo_world,
+  # yolo_grasp, and piper_moveit MUST be ACTIVE before the user
+  # hits this skill — but we don't enforce it at boot order; if
+  # they're not ready, the first pick() call fails fast with a clear
+  # "missing dependencies" message.
+  #
+  # Order in this list: skills come AFTER all primitives + services
+  # in rbnx boot's spawn order, but pick has no boot-time
+  # dependency on its upstreams (lazy-activate sees to that). So
+  # the order requirement is "after everything else", which is
+  # naturally satisfied by being in the skill: block.
+  #
+  # ⚠️ yolo_grasp_rbnx is currently in PLACEHOLDER mode — first
+  # pick() call will return failure until the real estimator is
+  # wired in yolo_grasp/main.py. See yolo_grasp_rbnx README.
+  #
+  # - name: pick
+  #   url: https://github.com/lhw2002426/pick_skill_rbnx
+  #   branch: main
+  #   config:
+  #     default_timeout_s:    60.0     # used when caller passes 0
+  #     default_max_retries:  5        # used when caller passes 0
+

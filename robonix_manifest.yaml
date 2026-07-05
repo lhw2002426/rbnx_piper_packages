@@ -8,14 +8,15 @@
 #                (url: lhw2002426/{piper_description_rbnx,easy_handeye2_rbnx};
 #                 calib YAML is still an identity PLACEHOLDER — replace
 #                 before real hardware. See easy_handeye2_rbnx README.)
-#   Stage 4 ✅ — yolo_world + yolo_grasp services
-#                (url: lhw2002426/{yolo_world_rbnx,yolo_grasp_rbnx};
-#                 yolo_grasp is in PLACEHOLDER mode — every grasp_request
-#                 returns success=false until the real estimator is
-#                 wired in. See yolo_grasp_rbnx README.)
+#   Stage 4 ✅ — llm_detect + yolo_grasp services (垂直抓取版)
+#                (url: lhw2002426/{llm_detect_rbnx,yolo_grasp_rbnx};
+#                 均使用 feature/vertical-grasp 分支：llm_detect 走
+#                 VLM 检测 + skip_depth；yolo_grasp 用固定桌面 z + 相机
+#                 射线反投影出 top-down 抓取位姿，取代了原 PLACEHOLDER。)
 #   Stage 5 ✅ — piper_moveit service     (url: lhw2002426/piper_moveit_rbnx)
 #   Stage 6 ✅ — pick skill — LLM-facing entry point
-#                (url: lhw2002426/pick_skill_rbnx)
+#                (url: lhw2002426/pick_skill_rbnx, feature/vertical-grasp
+#                 分支实现 pre-/grasp/post 三段动作序列)
 #
 # Pending hardware verification — see MIGRATION_PLAN.md tracking table.
 #
@@ -173,7 +174,8 @@ primitive:
   # waits for first RGB frame, then atlas-declares rgb / depth /
   # camera_info on /camera/{color,depth}/*. Must stay FIRST among the
   # primitives that consume `primitive/camera/*` indirectly (none here
-  # yet — yolo_world / yolo_grasp consume it from the service: block).
+  # yet — llm_detect / yolo_grasp consume it from the service: block;
+  # 垂直抓取模式下 depth 流其实用不到，但保留发布不影响 sentinel）。
   #
   - name: orbbec_camera
     url: https://github.com/lhw2002426/OrbbecSDK_rbnx
@@ -280,83 +282,77 @@ primitive:
 
 # service:
 service:
-  # ── Stage 4A: open-vocab object detection (YOLOE / YOLO-World) ────
-  # The ONLY GPU/ML package in the pipeline. Owns
-  # service/perception/object_detect/*.
+  # ── Stage 4A: LLM-VLM 目标检测（垂直抓取 pipeline 的 perception 入口） ───
+  # 走 llm_detect_rbnx（feature/vertical-grasp 分支）。相比原 yolo_world：
+  #   * 不再依赖 GPU / ultralytics 权重；
+  #   * RGB → OpenAI-compatible VLM → 2D bbox；
+  #   * 在垂直抓取模式下，depth 流完全不用（skip_depth=true），
+  #     从桌面 z 常量 + 相机射线反投影出抓取点。
+  # 老 yolo_world 服务已被替代，不再启用。
   #
-  # Surfaces both atlas-routed MCP (Pilot's path) and the legacy ROS
-  # service /yolo/detect_object (pick.py + yolo_grasp_rbnx still call
-  # it). Both share one detection function.
+  # Atlas 上游：primitive/camera/rgb + primitive/camera/camera_info。
+  # depth 由 skip_depth 直接跳过订阅。
   #
-  # Atlas-resolved upstream: primitive/camera/{rgb, depth, camera_info}.
-  # Defaults match OrbbecSDK_rbnx topic names — no override needed for
-  # the standard piper_grasp_deploy.
+  # Order: MUST come AFTER orbbec_camera（消费 camera 流）。
   #
-  # Order: MUST come AFTER orbbec_camera (consumes the camera streams).
-  # Order vs piper_ctl / piper_description / easy_handeye2 doesn't
-  # matter — those are TF / arm primitives, disjoint from yolo_world's
-  # camera-only deps.
-  #
-  # - name: yolo_world
-  #   url: https://github.com/lhw2002426/yolo_world_rbnx
-  #   branch: main
-  #   config:
-  #     # YOLOE weights — leave empty to let ultralytics auto-download
-  #     # to ~/.cache on first inference, or set absolute path to a
-  #     # pre-downloaded checkpoint:
-  #     # model_path: /opt/yolo_weights/yoloe-11l-seg-pf.pt
-  #     model_path: ""
+  - name: llm_detect
+    url: https://github.com/lhw2002426/llm_detect_rbnx
+    branch: feature/vertical-grasp
+    config:
+      # LLM API endpoint (OpenAI-compatible)
+      llm_base_url: "https://api.ofox.ai/v1"
+      llm_api_key: "sk-of-WmCvqhOuLuBxAExANMYGsYKajzuhTYyxAMuofRRdDbQnlKNUsYdPHAmizheeamZb"
+      llm_model: "google/gemini-3.1-flash-lite"
+      temperature: 0.7
 
-  #     # Topic overrides — empty means "atlas-resolve, fall back to
-  #     # default if no provider". The defaults already match
-  #     # OrbbecSDK_rbnx so the empties Just Work for this deploy.
-  #     rgb_topic: ""
-  #     depth_topic: ""
-  #     camera_info_topic: ""
+      # Set to true if camera is mounted opposite to arm (image needs
+      # 180° rotation before sending to LLM)
+      rotation_cam2arm: true
 
-  # - name: llm_detect
-  #   url: https://github.com/lhw2002426/llm_detect_rbnx
-  #   branch: main
-  #   config:
-  #     # LLM API endpoint (OpenAI-compatible)
-  #     llm_base_url: "https://api.ofox.ai/v1"
-  #     llm_api_key: "sk-of-WmCvqhOuLuBxAExANMYGsYKajzuhTYyxAMuofRRdDbQnlKNUsYdPHAmizheeamZb"
-  #     llm_model: "google/gemini-3.1-flash-lite"
-  #     temperature: 0.7
+      # 垂直抓取模式：跳过 depth 订阅与反投影，抓取点由 yolo_grasp
+      # 依据桌面 z 常量 + 相机射线交点算出。config 优先，env
+      # LLM_DETECT_SKIP_DEPTH=1 为 fallback。
+      skip_depth: true
 
-  #     # Set to true if camera is mounted opposite to arm (image needs
-  #     # 180° rotation before sending to LLM)
-  #     rotation_cam2arm: true
+      # Topic overrides — 空表示 atlas-resolve；默认值已匹配
+      # OrbbecSDK_rbnx，piper_grasp_deploy 下留空即可。
+      rgb_topic: ""
+      camera_info_topic: ""
+      # depth_topic 在 skip_depth=true 下无效，故省略。
 
-  #     # Topic overrides — empty means "atlas-resolve, fall back to
-  #     # default if no provider". The defaults already match
-  #     # OrbbecSDK_rbnx so the empties Just Work for this deploy.
-  #     rgb_topic: ""
-  #     depth_topic: ""
-  #     camera_info_topic: ""
-
-  # ── Stage 4B: geometric grasp-pose estimator ──────────────────────
-  # Pure CPU. Owns service/perception/grasp_pose/*. Calls yolo_world
-  # as a CLIENT (currently via legacy ROS service /yolo/detect_object;
-  # Stage 6 will switch to atlas MCP).
+  # ── Stage 4B: 垂直抓取 grasp-pose 计算器 ───────────────────────────
+  # Pure CPU。Owns service/perception/grasp_pose/*。整个算法已从原
+  # PLACEHOLDER 换成 feature/vertical-grasp 分支的固定 top-down 方案：
+  #   * xy: LLM bbox 中心像素 → 通过相机内参反投影一条射线 → 与桌面
+  #     z=z_table 平面求交，得到 base_link 系下的 (x, y)；
+  #   * z: 固定为配置常量 z_table + z_offset；
+  #   * orientation: 固定 roll=π / pitch=0 / yaw=default_yaw_rad；
+  #   * 夹爪开口: default_gripper_width；
+  #   * 三段动作序列（pre-grasp / grasp / post-grasp）交给 pick_skill
+  #     组织，approach_dist 是 pre/post 的 z 抬升量。
+  # 上游：llm_detect 的 bbox + easy_handeye2/piper_description 建的
+  # TF 树（base_frame ← camera_frame）。
   #
-  # ⚠️ Currently in PLACEHOLDER mode — every grasp_request returns
-  # success=false until the real upstream code is dropped into
-  # `yolo_grasp/_upstream/yolo_grasp.py` and IS_PLACEHOLDER flipped to
-  # False. See package README "Placeholder mode".
+  # Order: MUST come AFTER llm_detect（consumes 其检测结果）。
   #
-  # Order: MUST come AFTER yolo_world (atlas dep + ROS service
-  # client). Order vs primitives doesn't matter (no direct primitive
-  # subscriptions).
-  #
-  # - name: yolo_grasp
-  #   url: https://github.com/lhw2002426/yolo_grasp_rbnx
-  #   branch: main
-  #   # config: {} — no tunables until the real estimator lands.
-  #   # When wired, expect knobs like:
-  #   #   approach_distance_m: 0.10
-  #   #   gripper_max_width_m: 0.08
-  #   #   score_threshold:     0.3
+  - name: yolo_grasp
+    url: https://github.com/lhw2002426/yolo_grasp_rbnx
+    branch: feature/vertical-grasp
+    config:
+      # ── 垂直抓取参数（feature/vertical-grasp 分支新增） ──
+      # 桌面在 base_link 系下的 z（米）。必须用现场 tf2_echo 实测：
+      #   ros2 run tf2_ros tf2_echo arm/base_link <table_marker_link>
+      # 或直接尺量后填。z 错了要么抓空要么撞桌，是本 pipeline 最关键
+      # 的物理常量。
+      z_table: 0.02
+      z_offset: 0.0                       # z_table 之上的补偿，一般 0
+      approach_dist: 0.10                 # pre/post 抬升，米
+      default_yaw_rad: 0.0                # 抓取时末端 yaw；0=沿 base_x
+      default_gripper_width: 0.04         # 目标开口宽度，米
+      base_frame: "arm/base_link"
+      camera_frame: "camera_color_optical_frame"
+      camera_info_topic: "/camera/color/camera_info"
+      output_frame: "arm/base_link"
 
   # ── Stage 5: MoveIt + grasp executor ──────────────────────────────
   # Owns service/manipulation/*. Wraps the upstream MoveIt config
@@ -374,48 +370,48 @@ service:
   # AFTER easy_handeye2 (its static link6 → camera_color_optical_frame
   # TF is needed for the cpp's tf2 transform inside execute_grasp).
   # piper_description is also a dep (provides the unprefixed TF
-  # subtree). Order vs yolo_world / yolo_grasp doesn't matter
+  # subtree). Order vs llm_detect / yolo_grasp doesn't matter
   # (manipulation has no perception dep at boot time).
   #
-  # - name: piper_moveit
-  #   url: https://github.com/lhw2002426/piper_moveit_rbnx
-  #   branch: main
-  #   config:
-  #     arm_group_name:       arm
-  #     end_effector_link:    link6      # in prefixed TF subtree
-  #     gripper_action_name:  /gripper_controller/follow_joint_trajectory
-  #     sentinel_timeout_s:   60.0           # launch + first arm_status
-
-  - name: openvla_client
-    url: https://github.com/lhw2002426/vla_client_rbnx
+  - name: piper_moveit
+    url: https://github.com/lhw2002426/piper_moveit_rbnx
     branch: main
     config:
-      vla_server_url: "http://162.105.88.184:8777"
-      full_image_topic: /exterior_camera/color/image_raw
-      wrist_image_topic: /camera/color/image_raw
-      joint_states_topic: /arm/joint_states_single
-      pos_cmd_topic: /arm/pos_cmd
-      action_hz: 2
+      arm_group_name:       arm
+      end_effector_link:    link6      # in prefixed TF subtree
+      gripper_action_name:  /gripper_controller/follow_joint_trajectory
+      sentinel_timeout_s:   60.0           # launch + first arm_status
 
-      # 归一化常量（必须与训练数据集一致）
-      action_min: [-28042, 80978, -98976, -772.51, 49456.09, -29964, -400]
-      action_max: [4566, 122947, -63015, 3498, 68869.87, 14980, 84500]
-
-      # 硬件安全限位（SDK raw 单位，超出范围的指令会被裁剪）
-      hw_action_min: [-31400, 0, -150000, -90000, 0, -90000, -500]
-      hw_action_max: [31400, 180000, 0, 90000, 72000, 90000, 90000]
-
-      # 每步最大变化量（SDK raw 单位，防止关节突跳）
-      max_delta_per_step_sdk: [5000, 5000, 5000, 5000, 5000, 5000, 15000]
-
-      action_steps_to_execute: 5   # 每次调用执行的动作步数
+  # ── openvla_client：与垂直抓取 pipeline 互斥，本 manifest 关闭 ─────
+  # openvla_client 独占 /arm/pos_cmd 做 2Hz 闭环推理，会跟 piper_moveit
+  # 的 execute_grasp 撞车。垂直抓取 pipeline 起效时必须关掉它；如要跑
+  # VLA 演示，反过来注释掉 llm_detect / yolo_grasp / piper_moveit / pick。
+  # 未来考虑拆成 robonix_manifest.grasp.yaml / robonix_manifest.vla.yaml
+  # 两份，用 symlink 切换。
+  #
+  # - name: openvla_client
+  #   url: https://github.com/lhw2002426/vla_client_rbnx
+  #   branch: main
+  #   config:
+  #     vla_server_url: "http://162.105.88.184:8777"
+  #     full_image_topic: /exterior_camera/color/image_raw
+  #     wrist_image_topic: /camera/color/image_raw
+  #     joint_states_topic: /arm/joint_states_single
+  #     pos_cmd_topic: /arm/pos_cmd
+  #     action_hz: 2
+  #     action_min: [-28042, 80978, -98976, -772.51, 49456.09, -29964, -400]
+  #     action_max: [4566, 122947, -63015, 3498, 68869.87, 14980, 84500]
+  #     hw_action_min: [-31400, 0, -150000, -90000, 0, -90000, -500]
+  #     hw_action_max: [31400, 180000, 0, 90000, 72000, 90000, 90000]
+  #     max_delta_per_step_sdk: [5000, 5000, 5000, 5000, 5000, 5000, 15000]
+  #     action_steps_to_execute: 5
 
 
 # skill:
 skill:
   # ── Stage 6: pick-up-named-object skill ───────────────────────────
   # The LLM-facing entry point of the whole pipeline. Owns
-  # robonix/skill/pick/*. Orchestrates yolo_world + yolo_grasp +
+  # robonix/skill/pick/*. Orchestrates llm_detect + yolo_grasp +
   # piper_moveit into a single user-invocable `pick(object_name)`
   # MCP tool. All upstream calls go over MCP HTTP (atlas-resolved
   # at on_activate time) — no fallback to the legacy ROS service
@@ -424,7 +420,7 @@ skill:
   # Lazy activate: rbnx boot leaves the skill in INITIALIZED state.
   # The executor sends Driver(CMD_ACTIVATE) on the first MCP call,
   # at which point the skill blocks up to 60s waiting for atlas to
-  # resolve all three upstream services. So all of yolo_world,
+  # resolve all three upstream services. So all of llm_detect,
   # yolo_grasp, and piper_moveit MUST be ACTIVE before the user
   # hits this skill — but we don't enforce it at boot order; if
   # they're not ready, the first pick() call fails fast with a clear
@@ -436,14 +432,14 @@ skill:
   # the order requirement is "after everything else", which is
   # naturally satisfied by being in the skill: block.
   #
-  # ⚠️ yolo_grasp_rbnx is currently in PLACEHOLDER mode — first
-  # pick() call will return failure until the real estimator is
-  # wired in yolo_grasp/main.py. See yolo_grasp_rbnx README.
+  # 垂直抓取 pipeline 下 pick 的三段动作序列（pre-grasp → grasp →
+  # post-grasp）在 feature/vertical-grasp 分支实现；配合
+  # yolo_grasp 的 approach_dist 使用。
   #
-  # - name: pick
-  #   url: https://github.com/lhw2002426/pick_skill_rbnx
-  #   branch: main
-  #   config:
-  #     default_timeout_s:    60.0     # used when caller passes 0
-  #     default_max_retries:  5        # used when caller passes 0
+  - name: pick
+    url: https://github.com/lhw2002426/pick_skill_rbnx
+    branch: feature/vertical-grasp
+    config:
+      default_timeout_s:    60.0     # used when caller passes 0
+      default_max_retries:  5        # used when caller passes 0
 

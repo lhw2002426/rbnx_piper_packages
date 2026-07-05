@@ -1,0 +1,224 @@
+# Soma 接入部署 cheatsheet — Piper grasp deploy
+
+> Piper-arm + Orbbec + grasp pipeline 的 soma 接入速查页。设计与决策依据见
+> `/Users/howenliu/lab/docs/soma_two_stage_bringup.md`（v2 flat schema
+> 是 §12，PR review 意见落地是 §13）。姊妹部署的完整版是
+> `/Users/howenliu/lab/ranger_mini_deploy/SOMA_DEPLOY.md`——两个 deploy 的
+> Soma 接入姿势对齐，只是 body 描述 / URDF / manifest 内容不同。
+
+## 0. 触发条件
+
+执行下面任何一步之前确认：
+
+- [x] robonix 源码已合入 PR #91（soma 首次落地）+ PR #109（v2 flat schema
+      + pipe IPC stage-2 trigger）。这两个 PR 之后：
+        * `system/soma/src/{config,store,deployment,launcher,main}.rs`
+          是 flat schema；
+        * `tools/rbnx/src/cmd/deploy.rs::spawn_soma_binary` 用 `pipe(2)`
+          + `dup2` 把读端固定到子进程 fd 3；
+        * `capabilities/system/soma/get_yaml.v1.toml` / `get_urdf.v1.toml`
+          的 `kind = "service"`（不是 `"system"`）。
+- [ ] 当前 Piper 机器人 side 无在跑任务（避免撞坏正在跑的 grasp）。
+- [ ] CAN 已 up（`ip link show can_piper` 有 `UP`）；如未 up，先跑
+      `bash /Users/howenliu/lab/packages/piper_ctl_rbnx/scripts/can_activate.sh can_piper 1000000 "1-4.4:1.0"`。
+
+## 0.5 启动机制速览（Piper 侧一份，源码事实同 ranger）
+
+```
+rbnx boot
+  ├─ system builtin 阶段（rbnx 直接 fork）
+  │   atlas → executor → pilot → liaison → soma
+  │     ↑                                  ↑
+  │     bin_map 见 deploy.rs                spawn_soma_binary（PR #109）：
+  │                                        pipe(2) + dup2(read_fd, 3)
+  │                                        env ROBONIX_SOMA_STAGE_FD=3
+  │
+  ├─ 非 builtin system 阶段（rbnx spawn + Driver(CMD_INIT)）
+  │   本 manifest 目前不启用（memory/scene/speech 都注释掉了）
+  │
+  ├─ soma stage 1（soma 自己起，rbnx 不管这段）
+  │   primitive: orbbec_camera → piper_ctl → piper_description → easy_handeye2
+  │   每个都 spawn + wait_for_registration + CMD_INIT + CMD_ACTIVATE
+  │
+  ├─ service 阶段（rbnx spawn + Driver(CMD_INIT)）
+  │   openvla_client（本 manifest 目前唯一一个非注释 service）
+  │
+  ├─ stage 2 trigger
+  │   rbnx 起完 service 后 `write_all(b"stage2\n")` 到 soma 的 pipe 写端
+  │
+  └─ soma stage 2
+      本 manifest 的 skill 段目前全部注释 → soma 收到 stage2 后立刻走空
+      循环完成 stage 2，不 spawn 任何 skill 进程。
+      （将来解注释 pick / vla_client / etc. 时，会一个个 spawn + CMD_INIT
+       但不 CMD_ACTIVATE。）
+```
+
+soma 起来后自己向 atlas 注册两条 gRPC cap（`system/soma/src/main.rs`
+`register_soma_services_and_activate`）：
+
+```
+robonix/system/soma/get_yaml   Transport::Grpc  port 50091
+robonix/system/soma/get_urdf   Transport::Grpc  port 50091
+```
+
+## 1. 本 deploy 目录的相关文件
+
+```
+rbnx_piper_packages/
+├── robonix_manifest.yaml       ← 已加 system.soma: 块
+├── soma.yaml                   ← 本机产出（robot=piper_grasp_01, urdf=./urdf/piper.urdf）
+├── soma_config.local.yaml      ← 本机产出（v2 flat 四字段）
+├── urdf/
+│   ├── piper.urdf              ← 从 packages/piper_description_rbnx vendor 过来的 with-gripper 版
+│   └── README.md
+├── stop.sh                     ← 原有
+└── SOMA_DEPLOY.md              ← 你在读的这份
+```
+
+## 2. 在部署机上要做的事（按顺序）
+
+### 2.1 编 robonix-soma binary（整套同源 install）
+
+```bash
+ssh robot     # 或对应部署机的 ssh 别名
+export ROBONIX_SOURCE_PATH=/home/syswonder/wheatfox/robonix   # 按机器实际路径调整
+cd "$ROBONIX_SOURCE_PATH"
+
+git fetch origin
+git checkout main
+git pull --ff-only
+
+make build && make install   # 整套同源 install，避免 atlas/soma 半新半旧
+
+which robonix-soma && robonix-soma --help
+```
+
+> ⚠️ 不要单独 `cargo install -p robonix-soma`。要么整套 install，要么不动。
+> PR #91 之后 rbnx / atlas / soma 三者的 wire 一起演进，割裂 install 会
+> 触发 `unknown key system.soma` 或 pipe fd 传递失败等诡异 case。
+
+### 2.2 把本机产出的全部文件 scp 到部署机
+
+在你的 Mac 上：
+
+```bash
+cd /Users/howenliu/lab/rbnx_piper_packages
+DEPLOY_REMOTE=robot:~/lhw/rbnx_piper_packages/   # 按部署机上实际路径调整
+
+# 覆盖前建议先备份
+ssh robot 'cp ~/lhw/rbnx_piper_packages/robonix_manifest.yaml ~/lhw/rbnx_piper_packages/robonix_manifest.yaml.before-soma 2>/dev/null || true'
+
+scp robonix_manifest.yaml            "$DEPLOY_REMOTE"      # ★ 覆盖
+scp soma.yaml                        "$DEPLOY_REMOTE"
+scp soma_config.local.yaml           "$DEPLOY_REMOTE"
+ssh robot 'mkdir -p ~/lhw/rbnx_piper_packages/urdf'
+scp urdf/piper.urdf urdf/README.md   "$DEPLOY_REMOTE/urdf/"
+scp SOMA_DEPLOY.md                   "$DEPLOY_REMOTE"
+```
+
+### 2.3 静态校验
+
+```bash
+ssh robot
+cd ~/lhw/rbnx_piper_packages/
+rbnx validate
+```
+
+如果 `rbnx validate` 报 `unknown key system.soma` 或 `unknown key
+robot_yaml`，说明部署机上 `rbnx` 不是 PR #109 之后的版本 → 回到 §2.1
+重做 `make install`。
+
+顺手做一次纯 YAML 语法校验（不需要 rbnx，能在网络断开时也跑）：
+
+```bash
+python3 -c "import yaml; yaml.safe_load(open('robonix_manifest.yaml'))"
+python3 -c "import yaml; yaml.safe_load(open('soma.yaml'))"
+python3 -c "import yaml; yaml.safe_load(open('soma_config.local.yaml'))"
+```
+
+### 2.4 启动 + 验收
+
+```bash
+ssh robot
+cd ~/lhw/rbnx_piper_packages/
+rbnx boot
+```
+
+PR #109 的 rbnx boot 会把 `system.soma:` 翻译成：
+
+```
+robonix-soma \
+  --listen 127.0.0.1:50091 \
+  --atlas 127.0.0.1:50051 \
+  --provider-id soma \
+  --robot-yaml <abs>/rbnx_piper_packages/soma.yaml \
+  --config    <abs>/rbnx_piper_packages/soma_config.local.yaml \
+  --log info
+```
+
+`spawn_soma_binary` 起进程时会额外 `pipe(2)` + `dup2(read_fd, 3)` +
+env `ROBONIX_SOMA_STAGE_FD=3`。**不 chdir**，所以 `--robot-yaml` /
+`--config` 必须是绝对路径——rbnx 的 `ensure_soma_defaults` 已经帮你从
+`robonix_manifest.yaml` 目录 join 好绝对路径了。
+
+另开一个 ssh 跑验收命令：
+
+```bash
+# 1) 文件在
+ls soma.yaml soma_config.local.yaml urdf/piper.urdf
+
+# 2) soma 已注册 atlas 上的两条 grpc cap
+rbnx caps | grep soma
+rbnx caps -v | grep -A 3 'robonix/system/soma'
+# 期望：endpoint=127.0.0.1:50091, transport=grpc, state=ACTIVE
+
+# 3) gRPC 直连（用 grpcurl）—— 验证 soma 内部 store 载好了 yaml + urdf
+grpcurl -plaintext -d '{"robot_id":""}' 127.0.0.1:50091 \
+    robonix.contracts.RobonixSystemSomaGetYaml/GetYaml
+# 期望：yaml_text 里包含 "id: piper_grasp_01" 和 "Piper 6-DoF"
+
+grpcurl -plaintext -d '{"robot_id":""}' 127.0.0.1:50091 \
+    robonix.contracts.RobonixSystemSomaGetUrdf/GetUrdf
+# 期望：urdf_xml 包含 <robot name="piper"> 和 link name="link6"
+
+# 4) primitive 段（soma stage 1 起）应该都 ACTIVE
+rbnx caps -v | grep -E 'orbbec_camera|piper_ctl|piper_description|easy_handeye2'
+# 期望：orbbec_camera / piper_ctl 显示 ACTIVE；
+#       piper_description / easy_handeye2 是 capabilities: []，
+#       在 atlas 上只有 provider registration 没有 cap，rbnx caps -v
+#       里体现为 provider ACTIVE + no capability rows。
+
+# 5) service 段（rbnx 起）
+rbnx caps -v | grep openvla_client
+# 期望：ACTIVE
+
+# 6) skill 段：本 manifest 目前全部注释 → soma stage 2 空跑
+rbnx caps -v | grep skill
+# 期望：目前没有 skill 输出。若将来解注释 pick / vla_client，
+# 会显示 INACTIVE，等 pilot 首次 MCP 调用时 executor 才发 CMD_ACTIVATE。
+```
+
+## 3. 出错时
+
+| 症状 | 原因 | 处理 |
+|---|---|---|
+| `robonix-soma: command not found` | install 失败 / PATH 没刷新 | 回 §2.1 重做 `make install`；`source ~/.cargo/env` |
+| `rbnx validate` 报 `unknown key system.soma` 或 `robot_yaml` | rbnx 不是 PR #109 之后版本 | §2.1 重做 |
+| `rbnx caps` 看不到 soma 两条 cap | atlas 没起，或 soma 起来后 crash | 看 `rbnx-boot/logs/soma.log`（soma 自己的 stdout/stderr）；常见 crash：`read URDF '<path>': No such file` → §2.2 忘 scp `urdf/piper.urdf` |
+| `Error: parse '<path>/soma.yaml'` | soma.yaml 语法错（多半是复制粘贴时把注释里的 `#` 删了） | 用 `python3 -c "import yaml; yaml.safe_load(open('soma.yaml'))"` 快速定位；重新 scp |
+| `read URDF '<path>/urdf/piper.urdf': No such file` | urdf/ 没 scp 过去 | 回 §2.2 补 scp `urdf/piper.urdf` |
+| `<robot name="piper">` 出现但 `<link name="link6">` 缺失 | URDF 是老版 / 拷错文件 | 从 `/Users/howenliu/lab/packages/piper_description_rbnx/src/piper_description/urdf/piper_description.urdf` 重拷 |
+| soma stage 1 卡在 `waiting for provider ... to register` | orbbec 或 piper_ctl 没起来 | 看对应包的 `rbnx-boot/logs/<name>.log`；orbbec 常见 USB 权限，piper_ctl 常见 CAN 没 up |
+| stage 2 trigger 后 soma 没起 skill | 本 manifest 的 skill 段全注释了 → 正常。soma 会 log 一句 `stage 2 finished with 0 skills`。 | 无需处理 |
+
+## 4. 后续
+
+- 解注释 `service.yolo_world` / `service.yolo_grasp` / `service.piper_moveit`
+  时，别忘了在 `soma.yaml` 的 `tree.description.can_do` / `cannot_do`
+  段同步更新 —— 那些描述是给 pilot 的 LLM 看的，撒谎的代价是 pilot
+  可能编造出实际跑不动的工具组合。
+- 解注释 `skill.pick`（原 pick_skill_rbnx）时：pick 走 lazy activate，
+  `rbnx caps` 里会显示 INACTIVE 直到 pilot 首次 MCP 调用；不用手工预热。
+- 若要拿掉 gripper（跑纯 arm 的 VLA 演示），照 `urdf/README.md` 里的
+  "Swapping to the no-gripper variant" 走；`soma.yaml` 的 tree 里也把
+  gripper 那节删掉，保持描述一致。

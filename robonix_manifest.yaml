@@ -23,14 +23,30 @@
 # / skill: blocks below in dependency order (§2.2 of MIGRATION_PLAN).
 #
 # ─── Boot ordering: STRICTLY SERIAL, declaration order ─────────────
-# rbnx boot v0.1.x launches packages STRICTLY in the YAML
-# declaration order: every primitive[i] must reach Driver(CMD_INIT)
-# ok=true before primitive[i+1] is spawned; same for service[] and
-# skill[]. There is NO "deferred" retry mechanism — Driver returning
-# ok=false aborts the whole boot. So:
+# 自 2026-06 两阶段 bring-up 重构起（docs/soma_two_stage_bringup.md），
+# 各段的实际启动方分工是：
+#   * builtin (atlas / executor / pilot / liaison / soma / ...)  → rbnx
+#   * primitive                                                  → soma stage 1
+#   * service                                                    → rbnx
+#   * skill (INIT only, ACTIVATE deferred to first MCP call)     → soma stage 2
+#
+# 段内顺序仍然是 STRICTLY SERIAL，依赖声明顺序：
+#   * primitive[i] 必须 CMD_INIT ok=true 才会 spawn primitive[i+1]
+#     （soma launcher.rs run_stage）；
+#   * service[i] 同理（rbnx deploy.rs）；
+#   * skill[i] 同理（soma stage 2 一个一个走 spawn + CMD_INIT）。
+# 没有 "deferred" retry —— Driver 返回 ok=false 就 fail 当前 entry，
+# soma 把对应 pgid SIGKILL 后继续下一个（不再抛全 boot fatal）。
+# rbnx 这边 service 段仍然保持原来的 ok=false → bail。So:
 #   1) put providers BEFORE consumers
 #   2) packages without a `*/driver` interface skip CMD_INIT entirely
 #      and are considered "up" the moment they register on atlas.
+#
+# ⚠️ rbnx boot 已经**不再直接**启动 primitive / skill 段。若 manifest
+# 里有 primitive 或 skill 但没有 `system.soma:` 块，rbnx 会自动注入
+# 一个 empty mapping（`ensure_soma_defaults`），soma 起来后接管两阶段；
+# 但那样 soma 会去找相对本 manifest 目录的 `soma.yaml`，若不存在就 fail。
+# 本 deploy 显式配置 soma 块 + 提供 soma.yaml + urdf/，见下方 system.soma。
 # ───────────────────────────────────────────────────────────────────
 
 manifestVersion: 1
@@ -80,6 +96,63 @@ system:
   liaison:
     listen: 127.0.0.1:50081
     log: info
+
+  # ── soma ────────────────────────────────────────────────────────────
+  # 本体描述 + primitive/skill 编排服务。v2 flat schema（2026-07
+  # PR #109 review 后落地），四个字段：
+  #   atlas_endpoint / listen / provider_id / robot_yaml
+  #
+  # 提供 atlas 上两条 gRPC cap：
+  #   robonix/system/soma/get_yaml   — 读 soma.yaml 的 body description
+  #   robonix/system/soma/get_urdf   — 读 URDF（XML）
+  # 给 pilot/scene 等消费者用。
+  #
+  # 设计:        docs/Robonix 开发文档.md §五
+  # 两阶段说明:  ../docs/soma_two_stage_bringup.md（§12 是 v2 变更）
+  # 部署 cheatsheet: ./SOMA_DEPLOY.md
+  #
+  # ─── soma 在 rbnx 启动链中的位置 ────────────────────────────────────
+  # soma 是 rbnx 的 SYSTEM_BUILTIN。rbnx boot 用 `spawn_soma_binary`
+  # 特化 fork：建 `pipe(2)`，pre_exec 把读端 dup2 到 fd 3，设
+  # `ROBONIX_SOMA_STAGE_FD=3`；rbnx 父进程保留写端做 stage 2 trigger。
+  # 翻译规则在 deploy.rs 的 `"soma" =>` 分支，支持的 CLI flag：
+  #   --listen / --atlas / --provider-id / --robot-yaml / --config / --log
+  #
+  # ─── soma 启动后做的事（两阶段 bring-up，v2 模型） ─────────────────
+  # stage 1（soma 进程启动初期）：
+  #   1) 从 --robot-yaml 加载单个 robot 的 soma.yaml + URDF。
+  #   2) 从 robot_yaml 所在目录读同目录的 robonix_manifest.yaml，
+  #      对 primitive 段 spawn `rbnx start -p <pkg> --endpoint <atlas>`
+  #      → 等 atlas 注册 → CMD_INIT → CMD_ACTIVATE。
+  #   3) 向 atlas 注册自身的 get_yaml / get_urdf 两个 gRPC cap 并 ACTIVE。
+  #   4) 用 `tokio::fs::File::from_std` 把 fd 3 包成 async file，
+  #      `BufReader::read_line` 挂起等 `stage2\n`。
+  # stage 2（rbnx 起完 service: 段后往 pipe 写 `stage2\n` 触发）：
+  #   1) 对 skill 段：spawn → CMD_INIT，**不** ACTIVATE。
+  #   2) skill 留在 INACTIVE，由 executor 在 MCP 工具被首次调用时
+  #      再发 CMD_ACTIVATE。
+  #
+  # 也就是说：**rbnx boot 已经不再起 primitive / skill 段**。本
+  # manifest 有 primitive（orbbec/piper/描述/handeye）和 skill 计划，
+  # 所以**必须**起 soma；否则机器人不会动。
+  #
+  # 部署机上必须已 `make install` 整套源码（不能单独 cargo install
+  # robonix-soma），原因见 SOMA_DEPLOY.md。
+  soma:
+    listen: 127.0.0.1:50091
+    log: info
+    provider_id: soma
+    # `robot_yaml` 和 `config` 都由 rbnx 原样透传给 robonix-soma CLI，
+    # 且 rbnx 不 chdir，所以到达 soma 的必须是绝对路径。为了避免把
+    # 操作员的 HOME 写死，rbnx 在 `ensure_soma_defaults` 里对这两个
+    # 字段做了自动路径规范化（见 robonix/tools/rbnx/src/cmd/deploy.rs）：
+    #   * 绝对路径 → 原样保留（bind-mount / /opt 等 override 用）；
+    #   * 相对路径（含裸文件名） → join 到本 manifest 所在目录。
+    # 所以下面直接写相对本文件的路径即可，跨机克隆到任何目录都能跑。
+    robot_yaml: soma.yaml
+    # config 里的字段和上面重复没关系（CLI > config）；保留 --config
+    # 是为了 `robonix-soma --config <abs>` 本地手工调试也能跑。
+    config: soma_config.local.yaml
 
   # Non-builtin system services. rbnx boot resolves these by name to
   # `<robonix_source>/system/<key>/`. Currently only memory/ /

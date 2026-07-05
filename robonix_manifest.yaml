@@ -344,10 +344,20 @@ service:
       #   ros2 run tf2_ros tf2_echo arm/base_link <table_marker_link>
       # 或直接尺量后填。z 错了要么抓空要么撞桌，是本 pipeline 最关键
       # 的物理常量。
-      z_table: 0.02
+      # 现场实测（2026-07-05）：夹爪指尖触地时 tf2_echo arm/base_link
+      # → arm/link6 的 z = -0.186。MoveIt 规划目标即 arm/link6 原点，
+      # 所以这里直接填 link6 触地高度，不做 TCP 长度补偿。
+      z_table: -0.186
       z_offset: 0.0                       # z_table 之上的补偿，一般 0
       approach_dist: 0.10                 # pre/post 抬升，米
       default_yaw_rad: 0.0                # 抓取时末端 yaw；0=沿 base_x
+      # 方案 A（防翻手腕，j6 分支选择）：开启后忽略 default_yaw_rad，
+      # 用 atan2(y_base, x_base) 作为 yaw，使夹爪开口沿"基座→目标"
+      # 径向对齐。这样 j6 的可行区间被大幅收窄，MoveIt IK 不再容易
+      # 挑到 j6 ± π 的翻腕解。若希望开口方向再旋转 π/2（横向夹取），
+      # 把 radial_yaw_offset_rad 设为 1.5708；反向则 -1.5708。
+      radial_yaw: true
+      radial_yaw_offset_rad: 0.0
       default_gripper_width: 0.04         # 目标开口宽度，米
       base_frame: "arm/base_link"
       camera_frame: "camera_color_optical_frame"

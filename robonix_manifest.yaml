@@ -96,7 +96,8 @@ system:
     log: info
     vlm:
       upstream: https://api.ofox.ai/v1
-      api_key: sk-of-GZXXiYLTWxGtDWEyqBzyJfTEZpByJPjvbhBnzxGOnlzGZVeooWXAkNvjAjHzcoxf
+      # Fill in your own API key before running; do NOT commit real secrets.
+      api_key: <YOUR_LLM_API_KEY>
       model: gpt-5.4-mini
       api_format: openai
   liaison:
@@ -322,7 +323,8 @@ service:
     config:
       # LLM API endpoint (OpenAI-compatible)
       llm_base_url: "https://api.ofox.ai/v1"
-      llm_api_key: "sk-of-WmCvqhOuLuBxAExANMYGsYKajzuhTYyxAMuofRRdDbQnlKNUsYdPHAmizheeamZb"
+      # Fill in your own API key before running; do NOT commit real secrets.
+      llm_api_key: "<YOUR_LLM_API_KEY>"
       llm_model: "google/gemini-3.1-flash-lite"
       temperature: 0.7
 
@@ -379,6 +381,11 @@ service:
       # compensation.
       z_table: -0.186
       z_offset: 0.0                       # compensation above z_table, usually 0
+      # Global XY translation applied to the mapped grasp point before
+      # any yaw-dependent local offset. Use this for whole-field left/right
+      # or front/back correction after hand-eye calibration.
+      bias_x: 0.0
+      bias_y: 0.025
       approach_dist: 0.10                 # pre/post lift, meters
       default_yaw_rad: 0.0                # end-effector yaw during grasp; 0 = along base_x
       # Strategy A (avoid wrist flips by constraining the j6 branch):
